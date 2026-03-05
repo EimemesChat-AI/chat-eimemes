@@ -1,8 +1,8 @@
 /*
   EimemesChat AI — Express backend
-  Multi-model failover: Claude → GPT-4o → Gemini
+  Multi-model failover: Claude → GPT-4o → Gemini → Groq → HuggingFace
   Each provider has a hard 25 s timeout.
-  If all fail the client gets a clean 503.
+  If all fail the client gets a clean 503, and frontend shows a friendly error.
 */
 
 'use strict';
@@ -20,7 +20,6 @@ const ts  = () => new Date().toISOString();
 const log = (tag, msg) => console.log(`[${ts()}] [${tag}] ${msg}`);
 
 // ── Per-provider timeout helper ─────────────────────────────────
-// Wraps a fetch promise and rejects after `ms` milliseconds.
 function withTimeout(promise, ms, label) {
   let id;
   const timer = new Promise((_, reject) => {
@@ -45,8 +44,7 @@ async function tryClaude(messages, abortSignal) {
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify({
-      // claude-sonnet-4-6 is faster + cheaper than Opus; swap to opus-4-6 if you need max quality
-      model:      'claude-sonnet-4-6',
+      model:      'claude-3-sonnet-20240229',
       max_tokens: 1024,
       system:     'You are Eimemes AI, a helpful, knowledgeable, and friendly assistant. Keep responses clear and well-formatted. Be concise unless detail is requested.',
       messages:   messages.map(m => ({
@@ -77,7 +75,7 @@ async function tryOpenAI(messages, abortSignal) {
       Authorization:  `Bearer ${process.env.OPENAI_API_KEY}`,
     },
     body: JSON.stringify({
-      model: 'gpt-4o-mini',   // gpt-4o-mini is faster; change to gpt-4o for higher quality
+      model: 'gpt-4o-mini',
       max_tokens: 1024,
       messages: [
         {
@@ -137,7 +135,6 @@ async function tryGemini(messages, abortSignal) {
 async function tryGroq(messages, abortSignal) {
   if (!process.env.GROQ_API_KEY) throw new Error('GROQ_API_KEY not set');
 
-  // Groq uses the OpenAI-compatible chat completions API
   const fetchCall = fetch('https://api.groq.com/openai/v1/chat/completions', {
     method: 'POST',
     signal: abortSignal,
@@ -146,7 +143,7 @@ async function tryGroq(messages, abortSignal) {
       Authorization:  `Bearer ${process.env.GROQ_API_KEY}`,
     },
     body: JSON.stringify({
-      model: 'llama-3.3-70b-versatile', // fastest high-quality Groq model
+      model: 'llama-3.3-70b-versatile',
       max_tokens: 1024,
       messages: [
         {
@@ -174,7 +171,6 @@ async function tryGroq(messages, abortSignal) {
 async function tryHuggingFace(messages, abortSignal) {
   if (!process.env.HUGGINGFACE_API_KEY) throw new Error('HUGGINGFACE_API_KEY not set');
 
-  // Use HuggingFace Inference API (serverless) — OpenAI-compatible endpoint
   const fetchCall = fetch(
     'https://api-inference.huggingface.co/models/meta-llama/Llama-3.1-8B-Instruct/v1/chat/completions',
     {
@@ -211,7 +207,7 @@ async function tryHuggingFace(messages, abortSignal) {
   return { reply: data.choices[0].message.content, model: 'Llama (HF)' };
 }
 
-// Provider chain — first one with a key configured wins
+// Provider chain – first one with a key configured wins
 const PROVIDERS = [
   { name: 'Claude',       fn: tryClaude       },
   { name: 'OpenAI',       fn: tryOpenAI       },
@@ -228,15 +224,13 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json({ error: 'Message is required.' });
   }
 
-  // Build message array: history + current user message
   const messages = [
     ...history
-      .filter(m => m.role && m.content)   // skip malformed entries
+      .filter(m => m.role && m.content)
       .map(m => ({ role: m.role, content: m.content })),
     { role: 'user', content: message.trim() },
   ];
 
-  // Abort signal forwarded to fetch calls when client disconnects
   const ctrl = new AbortController();
   req.on('close', () => {
     if (!res.headersSent) ctrl.abort();
@@ -245,7 +239,7 @@ app.post('/api/chat', async (req, res) => {
   const errors = [];
 
   for (const { name, fn } of PROVIDERS) {
-    if (ctrl.signal.aborted) break; // client already gone
+    if (ctrl.signal.aborted) break;
 
     try {
       log('AI', `Trying ${name}…`);
@@ -255,11 +249,10 @@ app.post('/api/chat', async (req, res) => {
     } catch (err) {
       if (err.name === 'AbortError' || ctrl.signal.aborted) {
         log('AI', 'Client disconnected — aborting');
-        return; // don't send anything; connection is gone
+        return;
       }
       log('AI', `✗ ${name} failed — ${err.message}`);
       errors.push(`${name}: ${err.message}`);
-      // Continue to next provider
     }
   }
 
@@ -292,7 +285,6 @@ app.get('/api/health', (_req, res) => {
 });
 
 // ── Catch-all: serve index.html for any unknown route ───────────
-// (supports browser refresh on any path)
 app.get('*', (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
@@ -304,9 +296,9 @@ app.listen(PORT, () => {
 
   const configured = PROVIDERS.filter(p => {
     const keyMap = {
-    Claude: 'ANTHROPIC_API_KEY', OpenAI: 'OPENAI_API_KEY',
-    Groq: 'GROQ_API_KEY', Gemini: 'GEMINI_API_KEY', HuggingFace: 'HUGGINGFACE_API_KEY',
-  };
+      Claude: 'ANTHROPIC_API_KEY', OpenAI: 'OPENAI_API_KEY',
+      Groq: 'GROQ_API_KEY', Gemini: 'GEMINI_API_KEY', HuggingFace: 'HUGGINGFACE_API_KEY',
+    };
     return !!process.env[keyMap[p.name]];
   }).map(p => p.name);
 
